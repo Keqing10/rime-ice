@@ -1,0 +1,155 @@
+﻿name: Sync Upstream
+
+on:
+  schedule:
+    # Run every Sunday at 00:00 UTC (每周日 00:00 UTC 运行)
+    - cron: '0 0 * * 0'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      workflows: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream https://github.com/iDvel/rime-ice.git || true
+          git fetch upstream main
+
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+          DIFF=$(git rev-list --count HEAD..upstream/main 2>/dev/null || echo "0")
+
+          echo "local=$LOCAL" >> $GITHUB_OUTPUT
+          echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
+          echo "diff=$DIFF" >> $GITHUB_OUTPUT
+
+          if [ "$DIFF" -gt 0 ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "📦 Found $DIFF new commits from upstream"
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "✅ Already up to date"
+          fi
+
+      - name: Update `source` branch to upstream
+        if: steps.fetch.outputs.has_updates == 'true'
+        run: |
+          echo "Updating 'source' branch to match upstream/main..."
+
+          # Ensure we have the latest refs
+          git fetch origin source || true
+
+          # Force move local 'source' to upstream/main, then push to origin
+          git branch -f source upstream/main
+          git push -u origin source --force-with-lease
+
+          echo "✅ 'source' branch updated to upstream/main"
+
+      - name: Rebase and push
+        id: rebase
+        if: steps.fetch.outputs.has_updates == 'true'
+        run: |
+          echo "Rebasing main onto upstream/main..."
+
+          if git rebase upstream/main; then
+            git push origin main --force-with-lease
+            echo "✅ Successfully synced with upstream"
+            echo "rebased=true" >> $GITHUB_OUTPUT
+          else
+            git rebase --abort
+            echo "❌ Rebase failed due to conflicts"
+            echo "rebased=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Create and close success issue
+        if: steps.fetch.outputs.has_updates == 'true' && steps.rebase.outputs.rebased == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO=${{ github.repository }}
+          LABEL=sync-success
+
+          # Ensure label exists (create or update)
+          if ! gh label view "$LABEL" --repo "$REPO" >/dev/null 2>&1; then
+            gh label create --force "$LABEL" --repo "$REPO" --color 0E8A16 --description "sync success" || true
+          fi
+
+          TEMPLATE_FILE=".github/issue_bodies/template-success.md"
+          BODY_FILE=$(mktemp)
+          REPO=${{ github.repository }}
+          UPSTREAM=${{ steps.fetch.outputs.upstream }}
+          LOCAL=${{ steps.fetch.outputs.local }}
+          DIFF=${{ steps.fetch.outputs.diff }}
+          sed -e "s|__REPO__|$REPO|g" -e "s|__UPSTREAM__|$UPSTREAM|g" -e "s|__LOCAL__|$LOCAL|g" -e "s|__DIFF__|$DIFF|g" -e "s|__OWNER__|${{ github.repository_owner }}|g" "$TEMPLATE_FILE" > "$BODY_FILE"
+
+          # Create issue and capture URL output, then close it
+          ISSUE_URL=$(gh issue create --repo "$REPO" \
+            --title "✅ 上游同步成功" \
+            --body-file "$BODY_FILE" \
+            --label "$LABEL" 2>/dev/null || true)
+
+          rm -f "$BODY_FILE"
+
+          if [ -n "$ISSUE_URL" ]; then
+            ISSUE_NUMBER=$(basename "$ISSUE_URL")
+            # Short delay to allow notifications to be delivered
+            sleep 15
+            gh issue close "$ISSUE_NUMBER" --repo "$REPO" || true
+          fi
+
+      - name: Create issue on failure
+        if: failure() && steps.fetch.outputs.has_updates == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO=${{ github.repository }}
+          LABEL=sync-conflict
+
+          # Ensure label exists (create or update)
+          if ! gh label view "$LABEL" --repo "$REPO" >/dev/null 2>&1; then
+            gh label create --force "$LABEL" --repo "$REPO" --color FF0000 --description "sync conflict" || true
+          fi
+
+          # Check for existing open issue with this label
+          EXISTING_COUNT=$(gh issue list --repo "$REPO" --label "$LABEL" --state open --limit 1 | wc -l)
+
+          if [ "$EXISTING_COUNT" -eq 0 ]; then
+            TEMPLATE_FILE=".github/issue_bodies/template-failure.md"
+            BODY_FILE=$(mktemp)
+            REPO=${{ github.repository }}
+            UPSTREAM=${{ steps.fetch.outputs.upstream }}
+            LOCAL=${{ steps.fetch.outputs.local }}
+            DIFF=${{ steps.fetch.outputs.diff }}
+            sed -e "s|__REPO__|$REPO|g" -e "s|__UPSTREAM__|$UPSTREAM|g" -e "s|__LOCAL__|$LOCAL|g" -e "s|__DIFF__|$DIFF|g" -e "s|__OWNER__|${{ github.repository_owner }}|g" "$TEMPLATE_FILE" > "$BODY_FILE"
+
+            gh issue create --repo "$REPO" \
+              --title "⚠️ 上游同步失败 - 需要手动处理冲突" \
+              --body-file "$BODY_FILE" \
+              --assignee "${{ github.repository_owner }}" \
+              --label "$LABEL" || true
+
+            rm -f "$BODY_FILE"
+          fi
+
+      - name: No updates
+        if: steps.fetch.outputs.has_updates == 'false'
+        run: |
+          echo "✅ Repository is already up to date with upstream."
