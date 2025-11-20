@@ -1,0 +1,115 @@
+name: Sync Upstream and Create PR
+
+on:
+  schedule:
+    # Run every Sunday at 00:00 UTC (每周日 00:00 UTC 运行)
+    - cron: '0 0 * * 0'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to push to source branch
+      pull-requests: write  # Required to create PRs
+      issues: read  # Required by gh pr list
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for all branches
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/iDvel/rime-ice.git || true
+          git remote -v
+      
+      - name: Fetch upstream changes
+        id: fetch
+        run: |
+          git fetch upstream main
+          
+          LOCAL_COMMIT=$(git rev-parse origin/source 2>/dev/null || echo "")
+          UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+          
+          echo "local_commit=$LOCAL_COMMIT" >> $GITHUB_OUTPUT
+          echo "upstream_commit=$UPSTREAM_COMMIT" >> $GITHUB_OUTPUT
+          
+          if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "No updates from upstream"
+          else
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "Updates available from upstream"
+          fi
+      
+      - name: Sync to source branch
+        if: steps.fetch.outputs.has_updates == 'true'
+        run: |
+          git checkout -B source upstream/main
+          git push origin source --force
+      
+      - name: Check if PR already exists
+        if: steps.fetch.outputs.has_updates == 'true'
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_COUNT=$(gh pr list --head source --base main --state open --json number --jq 'length')
+          
+          if [ "$PR_COUNT" -gt 0 ]; then
+            echo "pr_exists=true" >> $GITHUB_OUTPUT
+            PR_NUMBER=$(gh pr list --head source --base main --state open --json number --jq '.[0].number')
+            echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "PR already exists: #$PR_NUMBER"
+          else
+            echo "pr_exists=false" >> $GITHUB_OUTPUT
+            echo "No existing PR found"
+          fi
+      
+      - name: Create Pull Request
+        if: steps.fetch.outputs.has_updates == 'true' && steps.check_pr.outputs.pr_exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_COMMIT=$(git log upstream/main -1 --pretty=format:"%s")
+          
+          PR_BODY=$(cat <<EOF
+          ## 上游同步更新
+          
+          此 PR 自动从上游仓库 [iDvel/rime-ice](https://github.com/iDvel/rime-ice) 同步最新更改到 \`source\` 分支。
+          
+          **上游最新提交:** $LATEST_COMMIT
+          
+          **上游提交 SHA:** ${{ steps.fetch.outputs.upstream_commit }}
+          
+          **本地提交 SHA (更新前):** ${{ steps.fetch.outputs.local_commit }}
+          
+          ### ⚠️ 请注意
+          - 请仔细检查更改内容
+          - 确认没有冲突后再手动合并
+          - 建议在本地测试后再合并到 main 分支
+          
+          ---
+          🤖 此 PR 由 GitHub Actions 自动创建
+          EOF
+          )
+          
+          gh pr create \
+            --base main \
+            --head source \
+            --title "Sync upstream changes from iDvel/rime-ice" \
+            --body "$PR_BODY" \
+            --assignee Keqing10
+      
+      - name: No updates notification
+        if: steps.fetch.outputs.has_updates == 'false'
+        run: |
+          echo "✅ No updates from upstream. Repository is up to date."
