@@ -12,7 +12,7 @@ jobs:
     permissions:
       contents: write  # Required to push to source branch
       pull-requests: write  # Required to create PRs
-      issues: read  # Required by gh pr list
+      issues: write  # Allow assigning users
     
     steps:
       - name: Checkout repository
@@ -107,7 +107,7 @@ jobs:
             --head source \
             --title "Sync upstream changes from iDvel/rime-ice" \
             --body "$PR_BODY" \
-            --assignee Keqing10
+            --assignee "${{ github.actor }}"
       
       - name: No updates notification
         if: steps.fetch.outputs.has_updates == 'false'
